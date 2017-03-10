@@ -1,0 +1,294 @@
+---
+title: "Wholesale Price"
+author: "Imane Fahli"
+date: "February 26, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r}
+# load libraries
+library(dplyr)
+library(plyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(data.table)
+library(readr)
+```
+```{r}
+# set up ------------------
+
+# locations
+locations <- read.csv("all_locations.csv", sep=",", header=T)
+processor.loc <- filter(locations, processor==1)
+
+# inventory
+inventory <- readr::read_csv("biotrackthc_inventory.csv")
+inventory.types <- read.csv("inventory_type.csv", sep=",", header=T)
+inventory$inv_date <- as.POSIXct(inventory$sessiontime,
+                                    origin = "1970-01-01", tz="America/Los_Angeles")
+inventory$inv_date <- as.Date(inventory$inv_date)
+inventory <- left_join(inventory, inventory.types, by="inventorytype")
+inventory$sample_id <- as.numeric(inventory$sample_id)
+inventory.select <- select(inventory, inv_invid = id, inv_strain = strain, inv_weight = weight,
+                           inv_location = location, inv_inv_type = inv_type_name, seized, inv_deleted = deleted,
+                           inv_usableweight = usableweight, inv_invparentid = inventoryparentid,
+                           inv_productname = productname, inv_date)
+inventory.processor <- filter(inventory.select, inv_location %in% processor.loc$location_id)
+
+# transfers
+transfers <- readr::read_csv("biotrackthc_inventorytransfers.csv")
+transfers$inventoryid <- as.numeric(transfers$inventoryid)
+transfers$usableweight <- as.numeric(transfers$usableweight)
+
+transfers.select <- transfers %>%
+  #filter(inventoryparentid %in% dis.select$inventoryid) %>%
+  select(trans_id = id, trans_invid = inventoryid, trans_strain = strain, trans_location = location,
+         trans_parentid = parentid, trans_invtype = inventorytype, trans_usableweight = usableweight,
+         trans_weight = weight,
+         trans_out_lisc = outbound_license, trans_in_lisc = inbound_license, trans_in_loc = inbound_location,
+         trans_saleprice = saleprice, trans_unitprice = unitprice)
+
+# get type names
+transfers.select <- transfers.select %>%
+  left_join(inventory.types, by=c("trans_invtype" = "inventorytype"))
+# get location names
+loc.name.city <- select(locations, trans_name = name, trans_license = licensenum, location_id, trans_city = city, trans_loctype = locationtypeNames)
+transfers.select <- transfers.select %>%
+  left_join(loc.name.city, by=c("trans_location" = "location_id"))
+transfers.select$trans_in_lisc <- as.integer(transfers.select$trans_in_lisc)
+
+# for transfers, get types of locations, in and outbound
+loc.name.city <- select(locations, name, licensenum, location_id, city, locationtypeNames)
+# this, adding location types, is where the count of trans_id and nrows loses sync ################
+# we get the same number of trans_ids as before
+# but now have 23853 extra rows, duplicate trans_ids
+transfers.select <- transfers.select %>%
+  # the increase comes from joining on liscense numbers
+  # maybe because of the duplicate liscense numbers we found
+  # using location instead keeps trans_id the same as nrows
+  #left_join(loc.name.city, by=c("trans_out_lisc" = "licensenum")) %>%
+  #rename(t_out_name = name, t_out_locid = location_id, t_out_city = city, t_out_type = locationtypeNames) %>%
+  # trying taking out joining out, because I think that's just what's in there already, 
+  # that's the trans_city, trans_location?
+  left_join(loc.name.city, by=c("trans_in_loc" = "location_id"))
+
+# get processor transfers
+transfers.processor <- filter(transfers.select, trans_out_lisc %in% processor.loc$licensenum)
+# trying to join to inventory to times
+# trying joining transfers inventory id to inventory id just to get that item, not going up a step
+inv.snip <- select(inventory.select, inv_invparentid, inv_invid, inv_date)
+transfers.processor <- left_join(transfers.processor, inv.snip, by=c("trans_invid" = "inv_invid"))
+
+
+# processor to retail only -----------
+process.to.retail <- transfers.processor %>%
+  filter(locationtypeNames=="Retailer" | locationtypeNames=="Retailer & Medical")
+```
+```{r}
+# remove some anomalies
+proc.retail.clean <- process.to.retail %>%
+  filter(trans_loctype != "Producer Tier 2", 
+         trans_unitprice > 0,
+         trans_saleprice > 0,
+         !is.na(trans_in_loc))
+```
+
+
+```{r}
+## wholesale and retail prices -------------
+## cleaning dispensing for comparing
+dispensing <- readr::read_csv("biotrackthc_dispensing.csv")
+dispensing.select <- select(dispensing, dispensingid = id, weight, saletime = 
+                              sessiontime,price, inventorytype, location)
+dispensing.select$saletime <- as.POSIXct(dispensing.select$saletime,
+                                  origin = "1970-01-01", tz="America/Los_Angeles") # LA = PST
+dispensing.select$saletime <- as.Date(dispensing.select$saletime)
+dispensing.select$price_x <- ifelse(dispensing.select$saletime >= "2015-07-01", 
+                                    dispensing.select$price*1.37, 
+                                    dispensing.select$price)
+# overall comparision, without time
+avg.saleprice <- ddply(dispensing.select, "inventorytype", summarize, avg_saleprice = median(price_x, na.rm=T))
+
+avg.procprice <- ddply(process.to.retail, "trans_invtype", summarize, avg_processorprice = median(trans_unitprice, na.rm=T))
+
+avg.saleprice %>%
+  filter(!is.na(inventorytype)) %>%
+  left_join(avg.procprice, by=c("inventorytype" = "trans_invtype")) %>%
+  left_join(inventory.types, by="inventorytype") %>%
+  tidyr::gather(supplystep, avg_price, c(avg_saleprice, avg_processorprice)) %>%
+  ggplot(aes(x=inv_type_name, y=avg_price, fill=supplystep)) +
+  geom_bar(stat="identity", position="dodge") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+# avg markup by type
+avg.saleprice %>%
+  filter(!is.na(inventorytype)) %>%
+  left_join(avg.procprice, by=c("inventorytype" = "trans_invtype")) %>%
+  group_by(inventorytype) %>%
+  mutate(
+    avg_markup_abs = avg_saleprice - avg_processorprice,
+    avg_markup_perc = (avg_saleprice - avg_processorprice) / avg_saleprice
+  ) %>%
+  left_join(inventory.types, by="inventorytype") %>%
+  ggplot(aes(x=reorder(inv_type_name, desc(avg_markup_perc)), y=avg_markup_perc)) +
+  geom_bar(stat="identity", fill = "darkgreen") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+### including time
+avg.sale.month <- mutate(dispensing.select,monthyear = floor_date(saletime, "month"))
+avg.sale.month.sum <- ddply(avg.sale.month, c("inventorytype", "monthyear"), summarise, avg_saleprice = median(price_x, na.rm=T))
+
+avg.proc.month <- mutate(process.to.retail, monthyear = floor_date(inv_date.x, "month"))
+avg.proc.month.sum <- ddply(avg.proc.month, c("trans_invtype", "monthyear"), summarise, avg_processorprice = median(trans_unitprice, na.rm=T))
+avg.proc.month.sum$monthyear <- as.Date(avg.proc.month.sum$monthyear)
+
+sum.markups <- left_join(avg.proc.month.sum,avg.sale.month.sum, by=c("monthyear", "trans_invtype" = "inventorytype"))
+
+#including quarters
+sum.markups <- mutate(sum.markups, time_period = ifelse(monthyear %between% c("2014-04-01","2014-06-01"), 'Q2 2014', ifelse(monthyear %between% c("2014-07-01","2014-09-01"), 'Q3 2014',ifelse(monthyear %between% c("2014-10-01", "2014-12-01"), 'Q4 2014', ifelse(monthyear %between% c("2015-01-01", "2015-03-01"), 'Q1 2015', ifelse(monthyear %between% c("2015-04-01", "2015-06-01"), 'Q2 2015', ifelse(monthyear %between% c("2015-07-01","  2015-09-01"), 'Q3 2015', ifelse(monthyear %between% c("2015-10-01","2015-12-01"), 'Q4 2015', ifelse(monthyear %between% c("2016-01-01","2016-03-01"), 'Q1 2016', ifelse(monthyear %between% c("2016-04-01","2016-06-01"), 'Q2 2016', ifelse(monthyear %between% c("2016-07-01","2016-09-01"), 'Q3 2016', ifelse(monthyear %between% c("2016-10-01","2016-12-01"), 'Q4 2016', 'other'))))))))))))
+
+#  bar graph for average markup
+sum.markups <- mutate(sum.markups, markup = ifelse(monthyear %between% c("2014-01-01","2015-06-30"),(avg_saleprice - avg_processorprice)/avg_saleprice,((avg_saleprice*1.37) - avg_processorprice)/(avg_saleprice*1.37)))
+
+sum.markups <- filter(sum.markups, !is.na(time_period), time_period!= "Q2 2014", time_period!= "Q3 2014")
+
+sum.markups2 <- filter(sum.markups, trans_invtype=="28" | trans_invtype=="22" | trans_invtype=="24")
+
+sum.markups2 <- mutate(sum.markups2, nameinv = ifelse(trans_invtype=="28", "Usable Marijuana", ifelse(trans_invtype=="22", "Solid Edibles", ifelse(trans_invtype=="24", "Extracts for Inhalation", "other"))))
+
+ggplot(data = sum.markups2, mapping = aes(x=monthyear, y=avg_processorprice)) + geom_line(mapping = aes(x=monthyear, y=avg_saleprice)) + geom_line(stat="identity") + facet_wrap("nameinv") + theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1))
+
+###
+sum.markups3 <- mutate(sum.markups, markup = ifelse(monthyear %between% c("2014-01-01","2015-06-30"),(avg_saleprice/avg_processorprice),((avg_saleprice*1.37)/avg_processorprice)))
+
+sum.markups3 <- filter(sum.markups3, !is.na(time_period), time_period!= "Q2 2014", time_period!= "Q3 2014")
+
+sum.markups4 <- filter(sum.markups3, trans_invtype=="28" | trans_invtype=="22" | trans_invtype=="24")
+
+sum.markups4 <- mutate(sum.markups4, nameinv = ifelse(trans_invtype=="28", "Usable Marijuana", ifelse(trans_invtype=="22", "Solid Edibles", ifelse(trans_invtype=="24", "Extracts for Inhalation", "other"))))
+sum.markups4 %>%
+  dplyr::filter(markup < 20) %>%
+  ggplot(mapping = aes(x=monthyear, y=markup)) + 
+  geom_line(stat="identity", size=2, color="darkgreen") +
+  facet_wrap("nameinv")
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1))
+
+## line graph of sale price and producer price, over time
+avg.sale.month %>%
+  left_join(avg.proc.month, by=c("monthjoin", "inventorytype" = "trans_invtype")) %>%
+  # needed to drop and rename some variables because of the weird join
+  select(inventorytype, month = monthyear.x, avg_saleprice, avg_processorprice) %>%
+  # gather so we get one value per row
+  tidyr::gather(supplystep, avg_price, c(avg_saleprice, avg_processorprice)) %>%
+  left_join(inventory.types, by="inventorytype") %>%
+  filter(!is.na(inventorytype), inv_type_name!="Capsule", inv_type_name!="Suppository",
+                inv_type_name!="Tincture") %>%
+  ggplot(aes(x=month, y=avg_price, color=supplystep)) +
+  geom_line() +
+  facet_wrap("inv_type_name")
+```
+```{r}
+# Looking for prestige brands ----------------
+# price per store, per inventory type
+avg.procprice.loc <- process.to.retail %>%
+  filter(!is.na(trans_invtype), trans_invtype!="26", trans_invtype!="35", trans_invtype!="37", trans_invtype!="34", trans_invtype!="32") %>%
+  group_by(trans_invtype, trans_location) %>%
+  summarise(avg_procprice_loc = mean(trans_unitprice, na.rm=T))
+
+# reference line
+avg.procprice.loc2 <- subset(avg.procprice.loc, select = 'avg_procprice_loc')
+
+# quantile plot
+ggplot(data=avg.procprice.loc, mapping=aes(sample=avg_procprice_loc)) + 
+  stat_qq(geom = 'point', distribution = qunif) + facet_wrap('trans_invtype') + stat_qq(data = avg.procprice.loc2, mapping = aes(sample = avg_procprice_loc), distribution = qunif, geom='line') + labs(x='Quantile', y='Wholesale price', title='Quantile Plot')
+```
+
+```{r}
+# Looking for differences by city
+procprice.seattle <- process.to.retail %>%
+  mutate(monthyear = floor_date(inv_date, "month")) %>%
+  filter(trans_city=="SEATTLE") %>%
+  group_by(trans_invtype, monthyear) %>%
+  summarise(avg_procprice_loc = mean(trans_unitprice, na.rm=T)) %>%
+  mutate(city = 'Seattle')
+
+procprice.vancouver <- process.to.retail %>%
+  mutate(monthyear = floor_date(inv_date, "month")) %>%
+  filter(trans_city=="VANCOUVER") %>%
+  group_by(trans_invtype, monthyear) %>%
+  summarise(avg_procprice_loc = mean(trans_unitprice, na.rm=T)) %>%
+  mutate(city = 'Vancouver')
+
+procprice.spokane <- process.to.retail %>%
+  mutate(monthyear = floor_date(inv_date, "month")) %>%
+  filter(trans_city=="SPOKANE") %>%
+  group_by(trans_invtype, monthyear) %>%
+  summarise(avg_procprice_loc = mean(trans_unitprice, na.rm=T)) %>%
+  mutate(city = 'Spokane')
+  
+procprice.other <- process.to.retail %>%
+  mutate(monthyear = floor_date(inv_date, "month")) %>%
+  filter(trans_city!="SEATTLE", trans_city!="VANCOUVER", trans_city!="SPOKANE") %>%
+  group_by(trans_invtype, monthyear) %>%
+  summarise(avg_procprice_loc = mean(trans_unitprice, na.rm=T)) %>%
+  mutate(city = 'Other')
+  
+procprice.all <- rbind(procprice.seattle, procprice.spokane, procprice.vancouver, procprice.other)
+procprice.all <- filter(procprice.all, !is.na(avg_procprice_loc),trans_invtype!="26", trans_invtype!="35", trans_invtype!="37", trans_invtype!="34", monthyear!="2014-06-01", monthyear!="2014-07-01", monthyear!="2014-08-01", monthyear!="2014-09-01", monthyear!="2014-10-01", monthyear!="2014-11-01", monthyear!="2014-12-01")
+
+ggplot(data = procprice.all, mapping = aes(x=monthyear, y=avg_procprice_loc, color = city)) + geom_line(stat='identity') + facet_wrap('trans_invtype')
+
+```
+
+```{r}
+# Market concentration ---------------
+market.conc <- process.to.retail %>%
+  group_by(trans_invtype, trans_name) %>%
+  summarise(total_proc_rev = sum(trans_saleprice, na.rm=T))
+
+# Market specialization -------------
+market.spe <- ddply(market.conc, "trans_invtype", summarize, unique.names = length(unique(trans_name)))
+```
+
+```{r}
+# For GIS --------------
+foryilun <- process.to.retail %>%
+  group_by(trans_name) %>%
+  summarise(total_rev = sum(trans_saleprice, na.rm=T))
+```
+```{r}
+# market share
+hhi <- ddply(process.to.retail,c("trans_out_lisc","trans_invtype"), summarize, total.rev = sum(trans_saleprice))
+hhi <- hhi %>%
+  filter(!is.na(total.rev))
+hhi <- ddply(hhi, "trans_invtype", summarize, market.share.2 = (total.rev/sum(total.rev)*100)^2)
+hhi <- filter(hhi, trans_invtype=="28" | trans_invtype=="22" | trans_invtype=="24")
+hhi_final <- ddply(hhi, "trans_invtype", summarize, sum_market_share=sum(market.share.2))
+
+```
+
+```{r}
+# total revenues by firm and inventory type 
+revenues <- ddply(process.to.retail,c("trans_out_lisc","trans_invtype"), summarize, total.revenues = sum(trans_saleprice))
+```
+
+```{r}
+# average weight
+weight <- filter(process.to.retail,!is.na(trans_usableweight),!is.na(trans_weight))
+weight2 <- ddply(weight,"trans_invtype", summarize, average_weight_um = median(trans_usableweight), average_weight_other = median(trans_weight))
+```
+```{r}
+
+```
+
